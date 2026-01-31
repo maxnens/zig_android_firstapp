@@ -1,0 +1,16 @@
+# Build outputs
+build/
+zig-out/
+.zig-cache/
+
+# Build number counter (increments each build)
+build_number.txt
+
+# Android signing
+*.keystore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
