@@ -167,6 +167,14 @@ pub fn findHighestApiLevel(allocator: std.mem.Allocator, sdk_path: []const u8) !
     return findHighestVersion(allocator, platforms_path, parseApiLevel);
 }
 
+/// Find highest API level supported by NDK (aarch64 libraries)
+pub fn findHighestNdkApiLevel(allocator: std.mem.Allocator, ndk_path: []const u8) !?u8 {
+    const lib_path = try std.fmt.allocPrint(allocator, "{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android", .{ndk_path});
+    defer allocator.free(lib_path);
+
+    return findHighestVersion(allocator, lib_path, parseMajorVersion);
+}
+
 /// Check if required build tools exist
 pub fn checkBuildTools(allocator: std.mem.Allocator, sdk_path: []const u8, version: []const u8) !bool {
     const tools = [_][]const u8{ "aapt2", "d8", "zipalign", "apksigner" };
@@ -314,4 +322,10 @@ test "checkNdkComponents returns false for non-existent path" {
     const allocator = std.testing.allocator;
     const result = try checkNdkComponents(allocator, "/nonexistent/ndk", 35);
     try std.testing.expect(!result);
+}
+
+test "findHighestNdkApiLevel returns null for non-existent path" {
+    const allocator = std.testing.allocator;
+    const result = try findHighestNdkApiLevel(allocator, "/nonexistent/ndk");
+    try std.testing.expectEqual(@as(?u8, null), result);
 }

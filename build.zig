@@ -260,44 +260,49 @@ fn validateAndConfigure(allocator: std.mem.Allocator, sdk_path: []const u8, ndk_
             });
         }
     } else {
-        // Auto-detect highest available API level
-        if (try prereq.findHighestApiLevel(allocator, sdk_path)) |level| {
-            if (level < opts.min_sdk) {
-                try errors.append(allocator, .{
-                    .component = "Android Platform",
-                    .message = std.fmt.allocPrint(allocator, "Highest available API ({d}) is below minimum SDK ({d})", .{ level, opts.min_sdk }) catch "API level too low",
-                    .suggestion = std.fmt.allocPrint(allocator, "Install with: sdkmanager --install \"platforms;android-{d}\"", .{opts.min_sdk}) catch "Install required platform",
-                });
-            }
-            api_level = level;
-        } else {
+        // Auto-detect API level considering both SDK platforms and NDK support
+        const sdk_api = try prereq.findHighestApiLevel(allocator, sdk_path);
+        const ndk_api = if (prereq.pathExists(ndk_path))
+            try prereq.findHighestNdkApiLevel(allocator, ndk_path)
+        else
+            null;
+
+        if (sdk_api == null) {
             try errors.append(allocator, .{
                 .component = "Android Platform",
                 .message = "No platforms found in SDK",
                 .suggestion = "Install with: sdkmanager --install \"platforms;android-35\"",
             });
+        } else if (ndk_api == null) {
+            // NDK issue handled separately
+            api_level = sdk_api.?;
+        } else {
+            // Use the minimum of SDK and NDK supported levels
+            const effective_level = @min(sdk_api.?, ndk_api.?);
+            if (effective_level < opts.min_sdk) {
+                try errors.append(allocator, .{
+                    .component = "API Level",
+                    .message = std.fmt.allocPrint(allocator, "Effective API level ({d}) is below minimum SDK ({d})", .{ effective_level, opts.min_sdk }) catch "API level too low",
+                    .suggestion = "Update SDK and NDK, or lower minimum SDK requirement",
+                });
+            }
+            api_level = effective_level;
+
+            // Inform user if NDK limited the API level
+            if (sdk_api.? > ndk_api.?) {
+                std.debug.print("Note: SDK has API {d}, but NDK only supports up to API {d}. Using API {d}.\n", .{ sdk_api.?, ndk_api.?, effective_level });
+            }
         }
     }
 
-    // Check NDK has required components for the target API
+    // Verify NDK has required components for the selected API level
     if (prereq.pathExists(ndk_path) and api_level > 0) {
         if (!try prereq.checkNdkComponents(allocator, ndk_path, api_level)) {
-            // Try to find a compatible API level in NDK
-            var found_compatible = false;
-            var check_level = api_level;
-            while (check_level >= opts.min_sdk) : (check_level -= 1) {
-                if (try prereq.checkNdkComponents(allocator, ndk_path, check_level)) {
-                    found_compatible = true;
-                    break;
-                }
-            }
-            if (!found_compatible) {
-                try errors.append(allocator, .{
-                    .component = "NDK Components",
-                    .message = std.fmt.allocPrint(allocator, "NDK missing aarch64 libraries for API {d}", .{api_level}) catch "Missing libraries",
-                    .suggestion = "Update NDK or use a lower API level with -Dapi-level=<level>",
-                });
-            }
+            try errors.append(allocator, .{
+                .component = "NDK Components",
+                .message = std.fmt.allocPrint(allocator, "NDK missing aarch64 libraries for API {d}", .{api_level}) catch "Missing libraries",
+                .suggestion = std.fmt.allocPrint(allocator, "Use -Dapi-level=<level> where level <= {d}", .{api_level -| 1}) catch "Use a lower API level",
+            });
         }
     }
 
