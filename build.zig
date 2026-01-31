@@ -143,6 +143,24 @@ pub fn build(b: *std.Build) void {
     const sign_apk = addApkSigning(b, android_config, apk_build);
     sign_step.dependOn(&sign_apk.step);
 
+    // Success message after signing
+    const success_msg = b.addSystemCommand(&.{ "sh", "-c",
+        \\echo ""
+        \\echo "=========================================="
+        \\echo "BUILD SUCCESSFUL"
+        \\echo "=========================================="
+        \\echo "APK: build/helloworld.apk"
+        \\echo ""
+        \\echo "To install on connected device:"
+        \\echo "  adb install -r build/helloworld.apk"
+        \\echo ""
+        \\echo "To install and launch:"
+        \\echo "  zig build deploy"
+        \\echo "  adb shell am start -n com.zig.helloworld/.MainActivity"
+        \\echo "=========================================="
+    });
+    success_msg.step.dependOn(&sign_apk.step);
+
     // Health checks
     const test_step = b.step("test", "Run health checks");
     const health_checks = addHealthChecks(b, android_config);
@@ -158,11 +176,9 @@ pub fn build(b: *std.Build) void {
     // Library-only step for testing
     const lib_step = b.step("lib", "Build native library only");
     lib_step.dependOn(&lib.step);
-    
-    // Note: Test can be run manually with `zig test src/build_info.zig`
 
     // Default build target
-    b.default_step.dependOn(sign_step);
+    b.default_step.dependOn(&success_msg.step);
 }
 
 fn getEnvOrDefault(allocator: std.mem.Allocator, env_var: []const u8, default: ?[]const u8) ?[]const u8 {

@@ -191,20 +191,52 @@ logger.err("Failed to initialize");
 
 ## Environment Setup
 
+Set environment variables to point to your Android SDK and NDK:
+
 ```bash
-export ANDROID_SDK_ROOT=/opt/android-sdk
-export ANDROID_NDK_ROOT=/opt/android-ndk
+export ANDROID_SDK_ROOT=/path/to/android-sdk
+export ANDROID_NDK_ROOT=/path/to/android-ndk
+```
+
+The build system will auto-detect:
+- Highest available build-tools version
+- Highest API level supported by both SDK and NDK
+- NDKs installed under `$ANDROID_SDK_ROOT/ndk/`
+
+You can also use command-line options to override:
+```bash
+zig build -Dandroid-sdk=/path/to/sdk -Dandroid-ndk=/path/to/ndk -Dapi-level=33
+```
+
+## Quick Start
+
+```bash
+# 1. Clone and build
+git clone <repo-url>
+cd helloworld
+zig build
+
+# 2. Connect your Android device via USB (enable USB debugging)
+
+# 3. Install and run
+adb install -r build/helloworld.apk
+adb shell am start -n com.zig.helloworld/.MainActivity
 ```
 
 ## Building
 
 ```bash
-# Build and install APK
+# Build the APK (outputs to build/helloworld.apk)
+zig build
+
+# Check prerequisites and show detected configuration
+zig build check
+
+# Build and install to connected device in one step
 zig build deploy
 
-# Or step by step:
-zig build check    # Verify prerequisites
-zig build lib      # Build native library  
+# Individual build steps:
+zig build lib      # Build native library only
 zig build java     # Compile Java sources
 zig build dex      # Create DEX bytecode
 zig build apk      # Package APK
@@ -212,15 +244,48 @@ zig build sign     # Sign APK
 zig build test     # Run health checks
 ```
 
-## Testing
+## Installing and Running
 
+### Option 1: Using zig build deploy
 ```bash
-# Install and launch
-adb install -r build/helloworld.apk
-adb shell am start -n com.zig.helloworld/.MainActivity
+# Builds, signs, and installs to connected device
+zig build deploy
 
-# Monitor logs
+# Then launch the app
+adb shell am start -n com.zig.helloworld/.MainActivity
+```
+
+### Option 2: Manual install
+```bash
+# Build first
+zig build
+
+# Install the APK (-r replaces existing installation)
+adb install -r build/helloworld.apk
+
+# Launch the app
+adb shell am start -n com.zig.helloworld/.MainActivity
+```
+
+### Monitoring Logs
+```bash
+# Watch app logs in real-time
 adb logcat -s ZigHelloWorld
+
+# Or combine launch and logging
+adb shell am start -n com.zig.helloworld/.MainActivity && adb logcat -s ZigHelloWorld
+```
+
+### Troubleshooting
+```bash
+# Check if device is connected
+adb devices
+
+# Uninstall previous version if having issues
+adb uninstall com.zig.helloworld
+
+# Check APK contents
+unzip -l build/helloworld.apk
 ```
 
 ### Expected vs Observed Device Test Results
@@ -262,9 +327,9 @@ D ZigHelloWorld: onCreate: Complete
 - ✅ Complete execution flow from Java → Zig → Android APIs → UI
 
 **Tested Device Configuration:**
-- Android API Level: 35 (Android 15)
+- Android API Level: Auto-detected (tested with API 30-35)
 - Architecture: ARM64 (aarch64)
-- Build Target: aarch64-linux-android with API 35 libraries
+- Build Target: aarch64-linux-android with auto-detected API level
 
 ## Build Number System
 
