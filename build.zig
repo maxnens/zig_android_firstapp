@@ -86,23 +86,30 @@ pub fn build(b: *std.Build) void {
     // Make sure build number is generated before library compilation
     lib.step.dependOn(&build_number_step.step);
 
-    // Use custom Android libc configuration
-    lib.setLibCFile(.{ .cwd_relative = "android-libc.conf" });
-    
+    // Generate android-libc.conf dynamically based on detected configuration
+    const libc_conf_path = generateLibcConfig(b, android_config) catch |err| {
+        std.debug.print("\n", .{});
+        std.debug.print("=" ** 70 ++ "\n", .{});
+        std.debug.print("LIBC CONFIGURATION ERROR\n", .{});
+        std.debug.print("=" ** 70 ++ "\n", .{});
+        std.debug.print("Failed to generate android-libc.conf: {}\n", .{err});
+        std.debug.print("\nThis usually means the NDK paths don't exist:\n", .{});
+        std.debug.print("  NDK: {s}\n", .{android_config.ndk_path});
+        std.debug.print("  API: {d}\n", .{android_config.api_level});
+        std.debug.print("=" ** 70 ++ "\n\n", .{});
+        return;
+    };
+    lib.setLibCFile(libc_conf_path);
+
     // Add Android NDK include directories for JNI headers
     const ndk_include = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include", .{android_config.ndk_path});
     lib.addIncludePath(.{ .cwd_relative = ndk_include });
-    
-    // Add library search paths for Android libraries
-    const ndk_lib_path = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/21", .{android_config.ndk_path});
+
+    // Add library search paths for Android libraries (use configured API level)
+    const ndk_lib_path = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/{d}", .{ android_config.ndk_path, android_config.api_level });
     lib.addLibraryPath(.{ .cwd_relative = ndk_lib_path });
-    
-    // Link against Android system libraries using proper API level
-    // Update to API 35 to match the device for better compatibility
-    const api_35_lib_path = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/35", .{android_config.ndk_path});
-    lib.addLibraryPath(.{ .cwd_relative = api_35_lib_path });
-    
-    // Link system libraries - libc should provide getauxval
+
+    // Link system libraries
     lib.linkSystemLibrary("c");
     lib.linkSystemLibrary("android");
     lib.linkSystemLibrary("log");
@@ -160,6 +167,51 @@ pub fn build(b: *std.Build) void {
 
 fn getEnvOrDefault(allocator: std.mem.Allocator, env_var: []const u8, default: ?[]const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, env_var) catch return default;
+}
+
+fn generateLibcConfig(b: *std.Build, config: AndroidConfig) !std.Build.LazyPath {
+    const ndk_sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/linux-x86_64/sysroot", .{config.ndk_path});
+    const include_dir = b.fmt("{s}/usr/include", .{ndk_sysroot});
+    const crt_dir = b.fmt("{s}/usr/lib/aarch64-linux-android/{d}", .{ ndk_sysroot, config.api_level });
+
+    // Validate paths exist
+    if (!prereq.pathExists(include_dir)) {
+        std.debug.print("ERROR: NDK include directory not found: {s}\n", .{include_dir});
+        return error.NdkIncludeNotFound;
+    }
+    if (!prereq.pathExists(crt_dir)) {
+        std.debug.print("ERROR: NDK CRT directory not found: {s}\n", .{crt_dir});
+        std.debug.print("       This means NDK doesn't have libraries for API {d}\n", .{config.api_level});
+
+        // Try to find what API levels are available
+        const ndk_lib_base = b.fmt("{s}/usr/lib/aarch64-linux-android", .{ndk_sysroot});
+        if (prereq.findHighestNdkApiLevel(b.allocator, config.ndk_path) catch null) |max_api| {
+            std.debug.print("       NDK supports up to API {d}\n", .{max_api});
+            std.debug.print("       Try: zig build -Dapi-level={d}\n", .{max_api});
+        } else {
+            std.debug.print("       NDK lib directory: {s}\n", .{ndk_lib_base});
+        }
+        return error.NdkCrtNotFound;
+    }
+
+    // Generate the config content
+    const config_content = b.fmt(
+        \\# Auto-generated Android NDK libc configuration
+        \\# Target: aarch64-linux-android API {d}
+        \\# NDK: {s}
+        \\
+        \\include_dir={s}
+        \\sys_include_dir={s}
+        \\crt_dir={s}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ config.api_level, config.ndk_path, include_dir, include_dir, crt_dir });
+
+    // Write to build directory
+    const wf = b.addWriteFiles();
+    return wf.add("android-libc.conf", config_content);
 }
 
 const ConfigOptions = struct {
@@ -366,6 +418,62 @@ fn printValidationErrors(allocator: std.mem.Allocator, validation: prereq.Valida
     std.debug.print("  NDK path: {s}\n", .{if (validation.ndk_path.len > 0) validation.ndk_path else "(not found)"});
     std.debug.print("  Build tools: {s}\n", .{if (validation.build_tools_version.len > 0) validation.build_tools_version else "(not found)"});
     std.debug.print("  API level: {d}\n", .{validation.api_level});
+
+    // Show environment variables
+    std.debug.print("\nEnvironment variables:\n", .{});
+    const env_sdk = std.process.getEnvVarOwned(allocator, "ANDROID_SDK_ROOT") catch null;
+    const env_home = std.process.getEnvVarOwned(allocator, "ANDROID_HOME") catch null;
+    const env_ndk = std.process.getEnvVarOwned(allocator, "ANDROID_NDK_ROOT") catch null;
+
+    std.debug.print("  ANDROID_SDK_ROOT: {s}\n", .{env_sdk orelse "(not set)"});
+    if (env_home) |h| {
+        std.debug.print("  ANDROID_HOME: {s}\n", .{h});
+        allocator.free(h);
+    }
+    std.debug.print("  ANDROID_NDK_ROOT: {s}\n", .{env_ndk orelse "(not set)"});
+
+    if (env_sdk) |s| allocator.free(s);
+    if (env_ndk) |n| allocator.free(n);
+
+    // Discover and show NDKs installed under SDK_ROOT
+    if (validation.sdk_path.len > 0 and prereq.pathExists(validation.sdk_path)) {
+        std.debug.print("\nNDKs found in SDK:\n", .{});
+        const discovered = prereq.discoverNdks(allocator, validation.sdk_path) catch &[_]prereq.NdkInfo{};
+
+        if (discovered.len == 0) {
+            std.debug.print("  (none found)\n", .{});
+            std.debug.print("\n  Install an NDK with:\n", .{});
+            std.debug.print("    sdkmanager --install \"ndk;27.2.12479018\"\n", .{});
+        } else {
+            for (discovered) |ndk| {
+                const info = prereq.formatNdkInfo(allocator, ndk) catch "  (error formatting)";
+                std.debug.print("{s}\n", .{info});
+            }
+
+            // Suggest setting NDK_ROOT if it's not pointing to one of the discovered NDKs
+            const current_ndk = validation.ndk_path;
+            var found_match = false;
+            var best_ndk: ?prereq.NdkInfo = null;
+
+            for (discovered) |ndk| {
+                if (std.mem.eql(u8, ndk.path, current_ndk)) {
+                    found_match = true;
+                }
+                // Track the best NDK (highest version with aarch64 libs)
+                if (ndk.max_api != null) {
+                    if (best_ndk == null or (ndk.version orelse 0) > (best_ndk.?.version orelse 0)) {
+                        best_ndk = ndk;
+                    }
+                }
+            }
+
+            if (!found_match and best_ndk != null) {
+                std.debug.print("\n  Suggestion: Set ANDROID_NDK_ROOT to use an installed NDK:\n", .{});
+                std.debug.print("    export ANDROID_NDK_ROOT={s}\n", .{best_ndk.?.path});
+            }
+        }
+    }
+
     std.debug.print("=" ** 70 ++ "\n\n", .{});
 }
 

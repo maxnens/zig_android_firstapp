@@ -179,6 +179,69 @@ pub fn findHighestNdkApiLevel(allocator: std.mem.Allocator, ndk_path: []const u8
     return findHighestVersion(allocator, lib_path, parseMajorVersion);
 }
 
+/// Information about a discovered NDK
+pub const NdkInfo = struct {
+    path: []const u8,
+    version: ?u8,
+    max_api: ?u8,
+};
+
+/// Scan SDK_ROOT for installed NDKs
+pub fn discoverNdks(allocator: std.mem.Allocator, sdk_path: []const u8) ![]NdkInfo {
+    var ndks: std.ArrayListUnmanaged(NdkInfo) = .{};
+
+    // Check $SDK_ROOT/ndk/ directory for versioned NDKs
+    const ndk_dir_path = try std.fmt.allocPrint(allocator, "{s}/ndk", .{sdk_path});
+    defer allocator.free(ndk_dir_path);
+
+    if (pathExists(ndk_dir_path)) {
+        var dir = std.fs.openDirAbsolute(ndk_dir_path, .{ .iterate = true }) catch null;
+        if (dir) |*d| {
+            defer d.close();
+            var iter = d.iterate();
+            while (try iter.next()) |entry| {
+                if (entry.kind == .directory) {
+                    const ndk_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ndk_dir_path, entry.name });
+                    const version = try readNdkVersion(allocator, ndk_path);
+                    const max_api = try findHighestNdkApiLevel(allocator, ndk_path);
+                    try ndks.append(allocator, .{
+                        .path = ndk_path,
+                        .version = version,
+                        .max_api = max_api,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check $SDK_ROOT/ndk-bundle (legacy location)
+    const ndk_bundle_path = try std.fmt.allocPrint(allocator, "{s}/ndk-bundle", .{sdk_path});
+    if (pathExists(ndk_bundle_path)) {
+        const version = try readNdkVersion(allocator, ndk_bundle_path);
+        const max_api = try findHighestNdkApiLevel(allocator, ndk_bundle_path);
+        try ndks.append(allocator, .{
+            .path = ndk_bundle_path,
+            .version = version,
+            .max_api = max_api,
+        });
+    } else {
+        allocator.free(ndk_bundle_path);
+    }
+
+    return ndks.toOwnedSlice(allocator);
+}
+
+/// Format NDK info for display
+pub fn formatNdkInfo(allocator: std.mem.Allocator, ndk: NdkInfo) ![]const u8 {
+    const version_str = if (ndk.version) |v| try std.fmt.allocPrint(allocator, "r{d}", .{v}) else try allocator.dupe(u8, "unknown");
+    defer allocator.free(version_str);
+
+    const api_str = if (ndk.max_api) |a| try std.fmt.allocPrint(allocator, "API {d}", .{a}) else try allocator.dupe(u8, "no aarch64 libs");
+    defer allocator.free(api_str);
+
+    return std.fmt.allocPrint(allocator, "  {s} (version {s}, max {s})", .{ ndk.path, version_str, api_str });
+}
+
 /// Check if required build tools exist
 pub fn checkBuildTools(allocator: std.mem.Allocator, sdk_path: []const u8, version: []const u8) !bool {
     const tools = [_][]const u8{ "aapt2", "d8", "zipalign", "apksigner" };
@@ -342,4 +405,11 @@ test "findHighestNdkApiLevel returns null for non-existent path" {
     const allocator = std.testing.allocator;
     const result = try findHighestNdkApiLevel(allocator, "/nonexistent/ndk");
     try std.testing.expectEqual(@as(?u8, null), result);
+}
+
+test "discoverNdks returns empty for non-existent SDK" {
+    const allocator = std.testing.allocator;
+    const result = try discoverNdks(allocator, "/nonexistent/sdk");
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
 }
