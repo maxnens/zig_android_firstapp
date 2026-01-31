@@ -98,14 +98,18 @@ pub fn findHighestBuildTools(allocator: std.mem.Allocator, sdk_path: []const u8)
     return highest_name;
 }
 
-/// Check if a path exists
+/// Check if a path exists (handles empty or relative paths gracefully)
 pub fn pathExists(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (!std.fs.path.isAbsolute(path)) return false;
     std.fs.accessAbsolute(path, .{}) catch return false;
     return true;
 }
 
-/// Check if a file exists
+/// Check if a file exists (handles empty or relative paths gracefully)
 pub fn fileExists(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (!std.fs.path.isAbsolute(path)) return false;
     const file = std.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
     return true;
@@ -259,8 +263,18 @@ test "pathExists returns false for non-existent paths" {
     try std.testing.expect(!pathExists("/this/path/does/not/exist/12345"));
 }
 
+test "pathExists handles empty and relative paths" {
+    try std.testing.expect(!pathExists(""));
+    try std.testing.expect(!pathExists("relative/path"));
+}
+
 test "fileExists returns false for non-existent files" {
     try std.testing.expect(!fileExists("/this/file/does/not/exist/12345.txt"));
+}
+
+test "fileExists handles empty and relative paths" {
+    try std.testing.expect(!fileExists(""));
+    try std.testing.expect(!fileExists("relative/file.txt"));
 }
 
 test "minimum version constants are reasonable" {
