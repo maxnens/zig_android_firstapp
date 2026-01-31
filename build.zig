@@ -1,4 +1,5 @@
 const std = @import("std");
+const prereq = @import("src/prereq.zig");
 
 const AndroidConfig = struct {
     sdk_path: []const u8,
@@ -15,22 +16,53 @@ pub fn build(b: *std.Build) void {
     // Generate build number
     const build_number_step = generateBuildNumber(b);
 
-    // Android configuration
-    const android_config = AndroidConfig{
-        .sdk_path = b.option([]const u8, "android-sdk", "Android SDK path") orelse getEnvOrDefault(b.allocator, "ANDROID_SDK_ROOT", "/opt/android-sdk"),
-        .ndk_path = b.option([]const u8, "android-ndk", "Android NDK path") orelse getEnvOrDefault(b.allocator, "ANDROID_NDK_ROOT", "/opt/android-ndk"),
-        .build_tools_version = b.option([]const u8, "build-tools", "Build tools version") orelse "35.0.0",
-        .api_level = b.option(u8, "api-level", "API level") orelse 35,
-        .min_sdk = b.option(u8, "min-sdk", "Minimum SDK") orelse 26,
-        .target_sdk = b.option(u8, "target-sdk", "Target SDK") orelse 35,
+    // Resolve paths from options, environment, or defaults
+    const sdk_path = b.option([]const u8, "android-sdk", "Android SDK path") orelse
+        getEnvOrDefault(b.allocator, "ANDROID_SDK_ROOT", null) orelse
+        getEnvOrDefault(b.allocator, "ANDROID_HOME", null) orelse
+        "/opt/android-sdk";
+
+    const ndk_path = b.option([]const u8, "android-ndk", "Android NDK path") orelse
+        getEnvOrDefault(b.allocator, "ANDROID_NDK_ROOT", null) orelse
+        b.fmt("{s}/ndk-bundle", .{sdk_path});
+
+    // Get min SDK option once
+    const min_sdk = b.option(u8, "min-sdk", "Minimum SDK version") orelse prereq.MIN_API_LEVEL;
+
+    // Validate prerequisites and auto-detect versions
+    const validation = validateAndConfigure(b.allocator, sdk_path, ndk_path, .{
+        .build_tools = b.option([]const u8, "build-tools", "Build tools version (auto-detected if not specified)"),
+        .api_level = b.option(u8, "api-level", "Target API level (auto-detected if not specified)"),
+        .min_sdk = min_sdk,
+    }) catch |err| {
+        std.debug.print("Configuration error: {}\n", .{err});
+        return;
     };
 
-    // Prerequisite checks
+    if (validation.hasErrors()) {
+        printValidationErrors(b.allocator, validation);
+        return;
+    }
+
+    const android_config = AndroidConfig{
+        .sdk_path = validation.sdk_path,
+        .ndk_path = validation.ndk_path,
+        .build_tools_version = validation.build_tools_version,
+        .api_level = validation.api_level,
+        .min_sdk = min_sdk,
+        .target_sdk = validation.api_level,
+    };
+
+    // Prerequisite checks step (for explicit validation)
     const check_step = b.step("check", "Check prerequisites");
-    const check_cmd = b.addSystemCommand(&.{"echo", "Checking prerequisites..."});
+    const check_cmd = b.addSystemCommand(&.{"echo"});
+    check_cmd.addArg(b.fmt("Prerequisites OK: SDK={s}, NDK={s}, build-tools={s}, API={d}", .{
+        android_config.sdk_path,
+        android_config.ndk_path,
+        android_config.build_tools_version,
+        android_config.api_level,
+    }));
     check_step.dependOn(&check_cmd.step);
-    
-    addPrerequisiteChecks(b, check_step, android_config);
 
     // Native library
     const target_query = std.Target.Query{
@@ -91,12 +123,12 @@ pub fn build(b: *std.Build) void {
     dex_compile.step.dependOn(java_step);
     dex_step.dependOn(&dex_compile.step);
 
+    // Install the library for APK packaging (must happen before APK build)
+    const install_lib = b.addInstallArtifact(lib, .{});
+
     // APK packaging
     const apk_step = b.step("apk", "Build APK");
-    const apk_build = addApkPackaging(b, android_config, res_compile, dex_compile);
-    apk_build.step.dependOn(&lib.step);
-    apk_build.step.dependOn(&res_compile.step);
-    apk_build.step.dependOn(&dex_compile.step);
+    const apk_build = addApkPackaging(b, android_config, res_compile, dex_compile, &install_lib.step);
     apk_step.dependOn(&apk_build.step);
 
     // APK signing
@@ -124,42 +156,192 @@ pub fn build(b: *std.Build) void {
 
     // Default build target
     b.default_step.dependOn(sign_step);
-    
-    // Install the library for APK packaging
-    b.installArtifact(lib);
 }
 
-fn getEnvOrDefault(allocator: std.mem.Allocator, env_var: []const u8, default: []const u8) []const u8 {
-    return std.process.getEnvVarOwned(allocator, env_var) catch default;
+fn getEnvOrDefault(allocator: std.mem.Allocator, env_var: []const u8, default: ?[]const u8) ?[]const u8 {
+    return std.process.getEnvVarOwned(allocator, env_var) catch return default;
 }
 
-fn addPrerequisiteChecks(b: *std.Build, step: *std.Build.Step, config: AndroidConfig) void {
-    // Check Android SDK
-    const check_sdk = b.addSystemCommand(&.{"sh", "-c"});
-    check_sdk.addArg(b.fmt("test -d '{s}' || (echo 'Error: Android SDK not found at {s}' >&2 && exit 1)", .{ config.sdk_path, config.sdk_path }));
-    step.dependOn(&check_sdk.step);
+const ConfigOptions = struct {
+    build_tools: ?[]const u8,
+    api_level: ?u8,
+    min_sdk: u8,
+};
 
-    // Check Android NDK
-    const check_ndk = b.addSystemCommand(&.{"sh", "-c"});
-    check_ndk.addArg(b.fmt("test -d '{s}' || (echo 'Error: Android NDK not found at {s}' >&2 && exit 1)", .{ config.ndk_path, config.ndk_path }));
-    step.dependOn(&check_ndk.step);
+fn validateAndConfigure(allocator: std.mem.Allocator, sdk_path: []const u8, ndk_path: []const u8, opts: ConfigOptions) !prereq.ValidationResult {
+    var errors: std.ArrayListUnmanaged(prereq.ValidationError) = .{};
 
-    // Check build tools
-    const build_tools_path = b.fmt("{s}/build-tools/{s}", .{ config.sdk_path, config.build_tools_version });
-    const check_build_tools = b.addSystemCommand(&.{"sh", "-c"});
-    check_build_tools.addArg(b.fmt("test -d '{s}' || (echo 'Error: Android build tools {s} not found at {s}' >&2 && exit 1)", .{ build_tools_path, config.build_tools_version, build_tools_path }));
-    step.dependOn(&check_build_tools.step);
+    // Validate SDK path exists
+    if (!prereq.pathExists(sdk_path)) {
+        try errors.append(allocator, .{
+            .component = "Android SDK",
+            .message = std.fmt.allocPrint(allocator, "Not found at: {s}", .{sdk_path}) catch "Not found",
+            .suggestion = "Set ANDROID_SDK_ROOT or ANDROID_HOME environment variable, or use -Dandroid-sdk=<path>",
+        });
+        return .{
+            .sdk_path = sdk_path,
+            .ndk_path = ndk_path,
+            .build_tools_version = "",
+            .api_level = 0,
+            .errors = try errors.toOwnedSlice(allocator),
+        };
+    }
 
-    // Check android.jar
-    const android_jar = b.fmt("{s}/platforms/android-{d}/android.jar", .{ config.sdk_path, config.api_level });
-    const check_android_jar = b.addSystemCommand(&.{"sh", "-c"});
-    check_android_jar.addArg(b.fmt("test -f '{s}' || (echo 'Error: android.jar not found for API level {d} at {s}' >&2 && exit 1)", .{ android_jar, config.api_level, android_jar }));
-    step.dependOn(&check_android_jar.step);
+    // Validate NDK path exists
+    if (!prereq.pathExists(ndk_path)) {
+        try errors.append(allocator, .{
+            .component = "Android NDK",
+            .message = std.fmt.allocPrint(allocator, "Not found at: {s}", .{ndk_path}) catch "Not found",
+            .suggestion = "Set ANDROID_NDK_ROOT environment variable, or use -Dandroid-ndk=<path>\n         Install with: sdkmanager --install \"ndk;27.0.12077973\"",
+        });
+    }
 
-    // Check debug keystore exists or can be created
-    const check_keystore = b.addSystemCommand(&.{"sh", "-c"});
-    check_keystore.addArg(b.fmt("test -f '{s}/.android/debug.keystore' || (echo 'Info: Debug keystore will be created automatically' && mkdir -p '{s}/.android')", .{ getHomeDir(b.allocator), getHomeDir(b.allocator) }));
-    step.dependOn(&check_keystore.step);
+    // Check NDK version if path exists
+    if (prereq.pathExists(ndk_path)) {
+        if (try prereq.readNdkVersion(allocator, ndk_path)) |ndk_version| {
+            if (ndk_version < prereq.MIN_NDK_MAJOR) {
+                try errors.append(allocator, .{
+                    .component = "Android NDK Version",
+                    .message = std.fmt.allocPrint(allocator, "Version {d} is below minimum required ({d})", .{ ndk_version, prereq.MIN_NDK_MAJOR }) catch "Version too old",
+                    .suggestion = "Update NDK: sdkmanager --install \"ndk;27.0.12077973\"",
+                });
+            }
+        }
+    }
+
+    // Auto-detect or validate build-tools version
+    var build_tools_version: []const u8 = "";
+    if (opts.build_tools) |bt| {
+        // User specified version - validate it exists
+        const bt_path = try std.fmt.allocPrint(allocator, "{s}/build-tools/{s}", .{ sdk_path, bt });
+        defer allocator.free(bt_path);
+        if (!prereq.pathExists(bt_path)) {
+            try errors.append(allocator, .{
+                .component = "Build Tools",
+                .message = std.fmt.allocPrint(allocator, "Version {s} not found", .{bt}) catch "Not found",
+                .suggestion = std.fmt.allocPrint(allocator, "Install with: sdkmanager --install \"build-tools;{s}\"", .{bt}) catch "Install required version",
+            });
+        } else {
+            build_tools_version = bt;
+        }
+    } else {
+        // Auto-detect highest available version
+        if (try prereq.findHighestBuildTools(allocator, sdk_path)) |bt| {
+            if (prereq.parseMajorVersion(bt)) |major| {
+                if (major < prereq.MIN_BUILD_TOOLS_MAJOR) {
+                    try errors.append(allocator, .{
+                        .component = "Build Tools",
+                        .message = std.fmt.allocPrint(allocator, "Highest available version ({s}) is below minimum ({d}.0.0)", .{ bt, prereq.MIN_BUILD_TOOLS_MAJOR }) catch "Version too old",
+                        .suggestion = "Install newer build-tools: sdkmanager --install \"build-tools;35.0.0\"",
+                    });
+                }
+            }
+            build_tools_version = bt;
+        } else {
+            try errors.append(allocator, .{
+                .component = "Build Tools",
+                .message = "No build-tools found in SDK",
+                .suggestion = "Install with: sdkmanager --install \"build-tools;35.0.0\"",
+            });
+        }
+    }
+
+    // Auto-detect or validate API level
+    var api_level: u8 = opts.api_level orelse 0;
+    if (opts.api_level) |level| {
+        // User specified level - validate it exists
+        const platform_path = try std.fmt.allocPrint(allocator, "{s}/platforms/android-{d}", .{ sdk_path, level });
+        defer allocator.free(platform_path);
+        if (!prereq.pathExists(platform_path)) {
+            try errors.append(allocator, .{
+                .component = "Android Platform",
+                .message = std.fmt.allocPrint(allocator, "API level {d} not found", .{level}) catch "Not found",
+                .suggestion = std.fmt.allocPrint(allocator, "Install with: sdkmanager --install \"platforms;android-{d}\"", .{level}) catch "Install required platform",
+            });
+        }
+    } else {
+        // Auto-detect highest available API level
+        if (try prereq.findHighestApiLevel(allocator, sdk_path)) |level| {
+            if (level < opts.min_sdk) {
+                try errors.append(allocator, .{
+                    .component = "Android Platform",
+                    .message = std.fmt.allocPrint(allocator, "Highest available API ({d}) is below minimum SDK ({d})", .{ level, opts.min_sdk }) catch "API level too low",
+                    .suggestion = std.fmt.allocPrint(allocator, "Install with: sdkmanager --install \"platforms;android-{d}\"", .{opts.min_sdk}) catch "Install required platform",
+                });
+            }
+            api_level = level;
+        } else {
+            try errors.append(allocator, .{
+                .component = "Android Platform",
+                .message = "No platforms found in SDK",
+                .suggestion = "Install with: sdkmanager --install \"platforms;android-35\"",
+            });
+        }
+    }
+
+    // Check NDK has required components for the target API
+    if (prereq.pathExists(ndk_path) and api_level > 0) {
+        if (!try prereq.checkNdkComponents(allocator, ndk_path, api_level)) {
+            // Try to find a compatible API level in NDK
+            var found_compatible = false;
+            var check_level = api_level;
+            while (check_level >= opts.min_sdk) : (check_level -= 1) {
+                if (try prereq.checkNdkComponents(allocator, ndk_path, check_level)) {
+                    found_compatible = true;
+                    break;
+                }
+            }
+            if (!found_compatible) {
+                try errors.append(allocator, .{
+                    .component = "NDK Components",
+                    .message = std.fmt.allocPrint(allocator, "NDK missing aarch64 libraries for API {d}", .{api_level}) catch "Missing libraries",
+                    .suggestion = "Update NDK or use a lower API level with -Dapi-level=<level>",
+                });
+            }
+        }
+    }
+
+    // Check build tools have required executables
+    if (build_tools_version.len > 0) {
+        if (!try prereq.checkBuildTools(allocator, sdk_path, build_tools_version)) {
+            try errors.append(allocator, .{
+                .component = "Build Tools",
+                .message = std.fmt.allocPrint(allocator, "Missing required tools in {s}", .{build_tools_version}) catch "Missing tools",
+                .suggestion = "Reinstall build-tools or try a different version",
+            });
+        }
+    }
+
+    return .{
+        .sdk_path = sdk_path,
+        .ndk_path = ndk_path,
+        .build_tools_version = build_tools_version,
+        .api_level = api_level,
+        .errors = try errors.toOwnedSlice(allocator),
+    };
+}
+
+fn printValidationErrors(allocator: std.mem.Allocator, validation: prereq.ValidationResult) void {
+    std.debug.print("\n", .{});
+    std.debug.print("=" ** 70 ++ "\n", .{});
+    std.debug.print("BUILD CONFIGURATION ERRORS\n", .{});
+    std.debug.print("=" ** 70 ++ "\n", .{});
+
+    for (validation.errors) |err| {
+        const formatted = prereq.formatError(allocator, err) catch {
+            std.debug.print("Error: {s} - {s}\n", .{ err.component, err.message });
+            continue;
+        };
+        std.debug.print("{s}", .{formatted});
+    }
+
+    std.debug.print("-" ** 70 ++ "\n", .{});
+    std.debug.print("Detected configuration:\n", .{});
+    std.debug.print("  SDK path: {s}\n", .{if (validation.sdk_path.len > 0) validation.sdk_path else "(not found)"});
+    std.debug.print("  NDK path: {s}\n", .{if (validation.ndk_path.len > 0) validation.ndk_path else "(not found)"});
+    std.debug.print("  Build tools: {s}\n", .{if (validation.build_tools_version.len > 0) validation.build_tools_version else "(not found)"});
+    std.debug.print("  API level: {d}\n", .{validation.api_level});
+    std.debug.print("=" ** 70 ++ "\n\n", .{});
 }
 
 fn addJavaCompilation(b: *std.Build, config: AndroidConfig) *std.Build.Step.Run {
@@ -225,25 +407,28 @@ fn addResourceCompilation(b: *std.Build, config: AndroidConfig) *std.Build.Step.
 
 fn addDexCompilation(b: *std.Build, config: AndroidConfig) *std.Build.Step.Run {
     const d8 = b.fmt("{s}/build-tools/{s}/d8", .{ config.sdk_path, config.build_tools_version });
-    
+    const android_jar = b.fmt("{s}/platforms/android-{d}/android.jar", .{ config.sdk_path, config.api_level });
+
     const dex_cmd = b.addSystemCommand(&.{
         d8,
+        "--lib", android_jar,
         "--output", "build/",
         "build/classes/com/zig/helloworld/MainActivity.class"
     });
-    
+
     return dex_cmd;
 }
 
-fn addApkPackaging(b: *std.Build, config: AndroidConfig, res_step: *std.Build.Step.Run, dex_step: *std.Build.Step.Run) *std.Build.Step.Run {
+fn addApkPackaging(b: *std.Build, config: AndroidConfig, res_step: *std.Build.Step.Run, dex_step: *std.Build.Step.Run, lib_install_step: *std.Build.Step) *std.Build.Step.Run {
     _ = config;
-    
+
     // Create APK directory structure
     const mkdir = b.addSystemCommand(&.{"mkdir", "-p", "build/apk/lib/arm64-v8a"});
-    
-    // Copy native library
+
+    // Copy native library (must wait for library to be installed)
     const copy_lib = b.addSystemCommand(&.{"cp", "zig-out/lib/libhelloworld.so", "build/apk/lib/arm64-v8a/"});
     copy_lib.step.dependOn(&mkdir.step);
+    copy_lib.step.dependOn(lib_install_step);
     
     // Extract resources (depends on resources step)
     const extract_res = b.addSystemCommand(&.{"unzip", "-o", "build/resources.apk", "-d", "build/apk/"});
